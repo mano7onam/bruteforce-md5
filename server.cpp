@@ -29,13 +29,15 @@ const long long BASE = 5LL;
 const int SELECT_TIMEOUT = 100000;
 const long long TIME_WAIT_CLIENT = 10000000LL;
 const long long DEFAULT_STEP = 100000LL;
+const int ADDRESS_MAX_SIZE = 1000;
 
+const int CLIENT_NOT_FOUND_ANSWER = 2;
 const int CLIENT_FOUND_ANSWER = 1;
-const int CLIENT_NOT_FOUND_ANSWER = 0;
+const int CLIENT_IN_PROCESS = 0;
 
 int server_socket;
 struct sockaddr_in my_addr;
-bool flag_init = false;
+//bool flag_init = false;
 
 struct ClientInfo{
     long long l;
@@ -55,6 +57,9 @@ struct ClientInfo{
     }
 
     ~ClientInfo() {
+        if (-1 != socket) {
+            close(socket);
+        }
         free(buf);
     }
 };
@@ -65,9 +70,11 @@ std::map<Ip_Port, ClientInfo*> clients;
 void * buf;
 int buf_size;
 
-char * answer_md5;
+char answer_md5[LITTLE_STRING_SIZE];
 size_t answer_md5_len = 32 + 1;
-char* answer_str; // will be answer on this task
+char correct_answer_str[LITTLE_STRING_SIZE]; // will be answer on this task
+char received_answer_str[LITTLE_STRING_SIZE]; // if receive from client
+//bool flag_found_message = false;
 
 std::map<char, long long> M;
 std::map<long long, char> RM;
@@ -75,6 +82,32 @@ std::map<long long, char> RM;
 long long get_cur_time() {
     auto cur_time = std::chrono::high_resolution_clock::now().time_since_epoch();
     return std::chrono::duration_cast<std::chrono::microseconds>(cur_time).count();
+}
+
+Ip_Port get_ip_port(struct sockaddr_in addr) {
+    uint32_t ip = addr.sin_addr.s_addr;
+    unsigned short port = addr.sin_port;
+    return std::make_pair(ip, port);
+}
+
+long long str_to_ll(std::string str) {
+    long long p5 = 1LL;
+    long long base = 5LL;
+    long long sum = 0;
+    for (int i = 0; i < str.size(); ++i) {
+        sum += M[str[i]] * p5;
+        p5 *= base;
+    }
+    return sum;
+}
+
+std::string ll_to_str(long long num) {
+    std::string str = "";
+    while (num) {
+        str += RM[num % BASE];
+        num /= BASE;
+    }
+    return str;
 }
 
 void init_socket(unsigned short port) {
@@ -98,8 +131,6 @@ void init_global() {
         M[v[i]] = i;
         RM[i] = v[i];
     }
-
-    buf = malloc(BUFFER_SIZE);
 }
 
 // so crutch...
@@ -121,29 +152,18 @@ std::string get_md5_sum(const char* str) {
     return md5sum;
 }
 
-long long str_to_ll(std::string str) {
-    long long p5 = 1LL;
-    long long base = 5LL;
-    long long sum = 0;
-    for (int i = 0; i < str.size(); ++i) {
-        sum += M[str[i]] * p5;
-        p5 *= base;
+long long get_max_right_bound() {
+    long long res = 1;
+    for (int i = 0; i < MAX_LENGTH; ++i) {
+        res *= BASE;
     }
-    return sum;
-}
-
-std::string ll_to_str(long long num) {
-    std::string str = "";
-    while (num) {
-        str += RM[num % BASE];
-        num /= BASE;
-    }
-    return str;
+    return res - 1LL;
 }
 
 std::vector<std::pair<long long, long long>> free_intervals;
 std::pair<long long, long long> get_next_interval() {
     static long long left_bound = 0LL;
+    static long long max_right_bound = get_max_right_bound();
 
     std::pair<long long, long long> res;
     if (!free_intervals.empty()) {
@@ -152,33 +172,92 @@ std::pair<long long, long long> get_next_interval() {
         return res;
     }
     else {
-        res = {left_bound, left_bound + DEFAULT_STEP};
+        if (left_bound > max_right_bound) {
+            return std::make_pair(-1LL, -1LL);
+        }
+        res = {left_bound, std::min(left_bound + DEFAULT_STEP, max_right_bound)};
         left_bound += DEFAULT_STEP;
         return res;
     }
 };
 
-int handle_new_connection() {
+int send_interval_to_new_client(Ip_Port ip_port) {
+    if (!clients.count(ip_port)) {
+        fprintf(stderr, "Error when send interval\n");
+        return -1;
+    }
 
+    ClientInfo * cl = clients[ip_port];
+    const long long d = 1000000000LL;
+    uint32_t buf[4] = {htonl((uint32_t)(cl->l / d)),
+                       htonl((uint32_t)(cl->l % d)),
+                       htonl((uint32_t)(cl->r / d)),
+                       htonl((uint32_t)(cl->r % d))};
+    send(cl->socket, (void*)buf, 4 * sizeof(uint32_t), 0);
+    close(cl->socket);
+    cl->socket = -1;
 }
 
-int handle_client_message() {
+int handle_new_connection() {
+    struct sockaddr_in addr;
+    socklen_t addr_size = sizeof(struct sockaddr_in);
+    int new_socket = accept(server_socket, (struct sockaddr *)&addr, &addr_size);
+    if (new_socket < 0) {
+        perror("accept");
+        return -1;
+    }
 
+    Ip_Port ip_port = get_ip_port(addr);
+    if (!clients.count(ip_port)) {
+        std::pair<long long, long long> interval = get_next_interval();
+        clients[ip_port] = new ClientInfo(new_socket, interval.first, interval.second, get_cur_time());
+        send_interval_to_new_client(ip_port);
+    }
+    else {
+        ClientInfo * cl = clients[ip_port];
+        cl->last_time = get_cur_time();
+        cl->socket = new_socket;
+    }
+}
+
+int handle_client_message(Ip_Port ip_port) {
+    if (!clients.count(ip_port)) {
+        fprintf(stderr, "Unknown ip_port in client message handler\n");
+        return -1;
+    }
+
+    ClientInfo * cl = clients[ip_port];
+    ssize_t res = recv(cl->socket, (void*)((char*)cl->buf + cl->pbuf), BUFFER_SIZE, 0);
+    if (res < 0) {
+        memcpy(received_answer_str, cl->buf, (size_t)cl->pbuf);
+        received_answer_str[cl->pbuf] = '\0';
+        if (strcmp(received_answer_str, correct_answer_str)) {
+            return CLIENT_NOT_FOUND_ANSWER;
+        }
+        else {
+            return CLIENT_FOUND_ANSWER;
+        }
+    }
+    else {
+        cl->pbuf += res;
+        return CLIENT_IN_PROCESS;
+    }
 }
 
 int main(int argc, char* argv[]) {
     init_global();
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:")) != -1) {
+    unsigned short my_port;
+    while ((opt = getopt(argc, argv, "p:m:")) != -1) {
         switch (opt) {
-            case 'p':
-                unsigned short port = (unsigned short)atoi(optarg);
-                init_socket(port);
-                break;
             case 'm':
                 answer_md5_len = strlen(optarg);
                 strncpy(answer_md5, optarg, answer_md5_len);
+                break;
+            case 'p':
+                my_port = (unsigned short)atoi(optarg);
+                init_socket(my_port);
                 break;
             default:
                 fprintf(stderr, "Unknown argument\n");
@@ -196,7 +275,7 @@ int main(int argc, char* argv[]) {
         max_fd = std::max(max_fd, server_socket);
 
         for (auto client : clients) {
-            int sock = client.second>socket;
+            int sock = client.second->socket;
             if (-1 == sock) {
                 continue;
             }
@@ -210,31 +289,39 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        std::vector<Ip_Port> outdates;
+        std::vector<Ip_Port> to_delete;
         for (auto client : clients) {
             int sock = client.second->socket;
             if (-1 == sock) {
                 continue;
             }
             if (FD_ISSET(sock, &fds)) {
-                int res = handle_client_message();
+                int res = handle_client_message(client.first);
                 if (res == CLIENT_FOUND_ANSWER) {
-                    fprintf(stderr, "Answer: %s\n", answer_str);
+                    fprintf(stderr, "Answer: %s\n", received_answer_str);
+                    flag_execute = false;
                     break;
                 }
-                else if (res == CLIENT_NOT_FOUND_ANSWER) {
+                else if (res == CLIENT_IN_PROCESS) {
                     client.second->last_time = get_cur_time();
+                }
+                else if (res == CLIENT_NOT_FOUND_ANSWER){
+                    to_delete.push_back(client.first);
                 }
             }
             else {
                 long long cur_time = get_cur_time();
                 long long diff = cur_time - client.second->last_time;
                 if (diff > TIME_WAIT_CLIENT) {
-                    outdates.push_back(client.first);
+                    to_delete.push_back(client.first);
                 }
             }
         }
-        for (auto id : outdates) {
+        if (!flag_execute) {
+            break;
+        }
+
+        for (auto id : to_delete) {
             long long l = clients[id]->l;
             long long r = clients[id]->r;
             free_intervals.push_back({l, r});
@@ -248,6 +335,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    free(buf);
+    for (auto client : clients) {
+        delete client.second;
+    }
+
     return 0;
 }
