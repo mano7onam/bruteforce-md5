@@ -20,11 +20,15 @@
 #include <libgen.h>
 #include <chrono>
 
-const int BUFFER_SIZE = 1000000;
+typedef std::pair<uint32_t, unsigned short> Ip_Port;
+
+const int BUFFER_SIZE = 10000;
 const int MAX_LENGTH = 7;
 const int LITTLE_STRING_SIZE = 256;
 const long long BASE = 5LL;
 const int SELECT_TIMEOUT = 100000;
+const long long TIME_WAIT_CLIENT = 10000000LL;
+const long long DEFAULT_STEP = 100000LL;
 
 const int CLIENT_FOUND_ANSWER = 1;
 const int CLIENT_NOT_FOUND_ANSWER = 0;
@@ -33,17 +37,45 @@ int server_socket;
 struct sockaddr_in my_addr;
 bool flag_init = false;
 
+struct ClientInfo{
+    long long l;
+    long long r;
+    long long last_time;
+    int socket;
+    void * buf;
+    int pbuf;
+
+    ClientInfo(int socket, long long l, long long r, long long last_time) {
+        this->socket = socket;
+        this->l = l;
+        this->r = r;
+        this->last_time = last_time;
+        buf = malloc(BUFFER_SIZE);
+        pbuf = 0;
+    }
+
+    ~ClientInfo() {
+        free(buf);
+    }
+};
+
 // it contain socket descriptor and last time receive message from
-std::set<std::pair<int, long long>> csockets;
+std::map<Ip_Port, ClientInfo*> clients;
 
 void * buf;
 int buf_size;
 
 char * answer_md5;
 size_t answer_md5_len = 32 + 1;
+char* answer_str; // will be answer on this task
 
 std::map<char, long long> M;
 std::map<long long, char> RM;
+
+long long get_cur_time() {
+    auto cur_time = std::chrono::high_resolution_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::microseconds>(cur_time).count();
+}
 
 void init_socket(unsigned short port) {
     socklen_t addr_size = sizeof(struct sockaddr_in);
@@ -109,6 +141,23 @@ std::string ll_to_str(long long num) {
     return str;
 }
 
+std::vector<std::pair<long long, long long>> free_intervals;
+std::pair<long long, long long> get_next_interval() {
+    static long long left_bound = 0LL;
+
+    std::pair<long long, long long> res;
+    if (!free_intervals.empty()) {
+        res = free_intervals.back();
+        free_intervals.pop_back();
+        return res;
+    }
+    else {
+        res = {left_bound, left_bound + DEFAULT_STEP};
+        left_bound += DEFAULT_STEP;
+        return res;
+    }
+};
+
 int handle_new_connection() {
 
 }
@@ -146,9 +195,13 @@ int main(int argc, char* argv[]) {
         FD_SET(server_socket, &fds);
         max_fd = std::max(max_fd, server_socket);
 
-        for (auto cs : csockets) {
-            FD_SET(cs.first, &fds);
-            max_fd = std::max(max_fd, cs.first);
+        for (auto client : clients) {
+            int sock = client.second>socket;
+            if (-1 == sock) {
+                continue;
+            }
+            FD_SET(sock, &fds);
+            max_fd = std::max(max_fd, sock);
         }
 
         struct timeval tv = {0, SELECT_TIMEOUT};
@@ -157,10 +210,37 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        for (auto cs : csockets) {
-            if (FD_ISSET(cs.first, &fds)) {
-                int res = handle_client_message();
+        std::vector<Ip_Port> outdates;
+        for (auto client : clients) {
+            int sock = client.second->socket;
+            if (-1 == sock) {
+                continue;
             }
+            if (FD_ISSET(sock, &fds)) {
+                int res = handle_client_message();
+                if (res == CLIENT_FOUND_ANSWER) {
+                    fprintf(stderr, "Answer: %s\n", answer_str);
+                    break;
+                }
+                else if (res == CLIENT_NOT_FOUND_ANSWER) {
+                    client.second->last_time = get_cur_time();
+                }
+            }
+            else {
+                long long cur_time = get_cur_time();
+                long long diff = cur_time - client.second->last_time;
+                if (diff > TIME_WAIT_CLIENT) {
+                    outdates.push_back(client.first);
+                }
+            }
+        }
+        for (auto id : outdates) {
+            long long l = clients[id]->l;
+            long long r = clients[id]->r;
+            free_intervals.push_back({l, r});
+
+            delete clients[id];
+            clients.erase(id);
         }
 
         if (FD_ISSET(server_socket, &fds)) {
