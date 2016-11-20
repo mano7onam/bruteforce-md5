@@ -43,12 +43,12 @@ struct ClientInfo{
     long long l;
     long long r;
     long long last_time;
-    int socket;
+    int socket_fd;
     void * buf;
     int pbuf;
 
     ClientInfo(int socket, long long l, long long r, long long last_time) {
-        this->socket = socket;
+        this->socket_fd = socket;
         this->l = l;
         this->r = r;
         this->last_time = last_time;
@@ -57,8 +57,8 @@ struct ClientInfo{
     }
 
     ~ClientInfo() {
-        if (-1 != socket) {
-            close(socket);
+        if (-1 != socket_fd) {
+            close(socket_fd);
         }
         free(buf);
     }
@@ -193,9 +193,9 @@ int send_interval_to_new_client(Ip_Port ip_port) {
                        htonl((uint32_t)(cl->l % d)),
                        htonl((uint32_t)(cl->r / d)),
                        htonl((uint32_t)(cl->r % d))};
-    send(cl->socket, (void*)buf, 4 * sizeof(uint32_t), 0);
-    close(cl->socket);
-    cl->socket = -1;
+    send(cl->socket_fd, (void*)buf, 4 * sizeof(uint32_t), 0);
+    close(cl->socket_fd);
+    cl->socket_fd = -1;
 }
 
 int handle_new_connection() {
@@ -216,7 +216,7 @@ int handle_new_connection() {
     else {
         ClientInfo * cl = clients[ip_port];
         cl->last_time = get_cur_time();
-        cl->socket = new_socket;
+        cl->socket_fd = new_socket;
     }
 }
 
@@ -227,7 +227,7 @@ int handle_client_message(Ip_Port ip_port) {
     }
 
     ClientInfo * cl = clients[ip_port];
-    ssize_t res = recv(cl->socket, (void*)((char*)cl->buf + cl->pbuf), BUFFER_SIZE, 0);
+    ssize_t res = recv(cl->socket_fd, (void*)((char*)cl->buf + cl->pbuf), BUFFER_SIZE, 0);
     if (res < 0) {
         memcpy(received_answer_str, cl->buf, (size_t)cl->pbuf);
         received_answer_str[cl->pbuf] = '\0';
@@ -249,9 +249,9 @@ int main(int argc, char* argv[]) {
 
     int opt;
     unsigned short my_port;
-    while ((opt = getopt(argc, argv, "p:m:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:a:")) != -1) {
         switch (opt) {
-            case 'm':
+            case 'a':
                 answer_md5_len = strlen(optarg);
                 strncpy(answer_md5, optarg, answer_md5_len);
                 break;
@@ -275,7 +275,7 @@ int main(int argc, char* argv[]) {
         max_fd = std::max(max_fd, server_socket);
 
         for (auto client : clients) {
-            int sock = client.second->socket;
+            int sock = client.second->socket_fd;
             if (-1 == sock) {
                 continue;
             }
@@ -291,7 +291,7 @@ int main(int argc, char* argv[]) {
 
         std::vector<Ip_Port> to_delete;
         for (auto client : clients) {
-            int sock = client.second->socket;
+            int sock = client.second->socket_fd;
             if (-1 == sock) {
                 continue;
             }
@@ -313,6 +313,10 @@ int main(int argc, char* argv[]) {
                 long long cur_time = get_cur_time();
                 long long diff = cur_time - client.second->last_time;
                 if (diff > TIME_WAIT_CLIENT) {
+                    long long l = client.second->l;
+                    long long r = client.second->r;
+                    free_intervals.push_back({l, r});
+
                     to_delete.push_back(client.first);
                 }
             }
@@ -322,10 +326,6 @@ int main(int argc, char* argv[]) {
         }
 
         for (auto id : to_delete) {
-            long long l = clients[id]->l;
-            long long r = clients[id]->r;
-            free_intervals.push_back({l, r});
-
             delete clients[id];
             clients.erase(id);
         }
