@@ -1,1 +1,229 @@
-abcd
+//
+// Created by mano on 20.11.16.
+//
+
+#include <iostream>
+#include <fstream>
+#include <map>
+#include <set>
+#include <algorithm>
+#include <cassert>
+#include <vector>
+#include <string>
+#include <signal.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <netdb.h>
+#include <libgen.h>
+#include <chrono>
+
+const int BUFFER_SIZE = 1000000;
+const int ADDRESS_MAX_SIZE = 1000;
+const long long CONNECTION_TIMEOUT = 3000000LL; // millisecnds
+const int TIME_SLEEP = 3; // seconds
+const int MAX_ATTEMPTS_CONNECT = 10;
+const int MD5_SIZE = 32;
+const long long BASE = 5LL;
+const int LITTLE_STRING_SIZE = 1000;
+
+char str_server_addr[ADDRESS_MAX_SIZE];
+struct sockaddr_in server_addr;
+int client_socket;
+
+void * buf;
+int pbuf;
+
+std::pair<long long, long long> interval;
+char md5_answer[MD5_SIZE + 1];
+std::string found_answer = "AGTC";
+
+std::map<char, long long> M;
+std::map<long long, char> RM;
+
+long long str_to_ll(std::string str) {
+    long long p5 = 1LL;
+    long long base = 5LL;
+    long long sum = 0;
+    for (int i = 0; i < str.size(); ++i) {
+        sum += M[str[i]] * p5;
+        p5 *= base;
+    }
+    return sum;
+}
+
+std::string ll_to_str(long long num) {
+    std::string str = "";
+    while (num) {
+        str += RM[num % BASE];
+        num /= BASE;
+    }
+    return str;
+}
+
+struct sockaddr_in get_address(char *strip, char *strport) {
+    struct sockaddr_in addr;
+    bzero(&addr, sizeof(struct sockaddr_in));
+    addr.sin_family = PF_INET;
+    addr.sin_port = htons((unsigned short)atoi(strport));
+    struct hostent *host_info = gethostbyname(strip);
+    memcpy(&(addr.sin_addr), host_info->h_addr, (size_t)host_info->h_length);
+    return addr;
+}
+
+bool parse_address(char* cstr_addr, struct sockaddr_in &addr) {
+    fprintf(stderr, "Addr: %s\n", cstr_addr);
+    std::string str_addr(cstr_addr);
+    size_t pos = str_addr.find(':');
+    size_t len = str_addr.size();
+    if (pos == std::string::npos) {
+        fprintf(stderr, "Bad string\n");
+        return false;
+    }
+
+    char strip[1000];
+    char strport[1000];
+    strncpy(strip, cstr_addr, pos);
+    strip[pos] = '\0';
+    strncpy(strport, cstr_addr + pos + 1, len - pos - 1);
+    strport[len - pos - 1] = '\0';
+
+    addr = get_address(strip, strport);
+    return true;
+}
+
+std::string get_md5_sum(const char* str) {
+    std::ofstream out("file_md5_sum_file_md5_sum");
+    out << str;
+    out.close();
+
+    char command[LITTLE_STRING_SIZE];
+    char result[LITTLE_STRING_SIZE];
+    snprintf(command, LITTLE_STRING_SIZE, "md5sum file_md5_sum_file_md5_sum");
+    FILE * md5 = popen(command, "r");
+    fgets(result, LITTLE_STRING_SIZE, md5);
+
+    remove("file_md5_sum_file_md5_sum");
+
+    std::string md5sum = std::string(result);
+    md5sum = md5sum.substr(0, md5sum.find(' '));
+    return md5sum;
+}
+
+void init_global() {
+    std::vector<char> v = {' ', 'A', 'G', 'T', 'C'};
+    for (int i = 0; i < v.size(); ++i) {
+        M[v[i]] = i;
+        RM[i] = v[i];
+    }
+
+    buf = malloc(BUFFER_SIZE);
+    pbuf = 0;
+}
+
+void parse_buffer() {
+    std::vector<long long> v(4);
+    for (int i = 0; i < 4; ++i) {
+        v[i] = (long long)ntohl(((uint32_t*)(buf))[i]);
+    }
+    const long long d = 1000000000LL;
+    long long l = v[0] * d + v[1];
+    long long r = v[2] * d + v[3];
+    interval = {l, r};
+    strncpy(md5_answer, (char*)buf + 4 * sizeof(uint32_t), MD5_SIZE);
+    md5_answer[MD5_SIZE] = '\0';
+}
+
+void endless_try_to_connect() {
+    int res = connect(client_socket, (struct sockaddr *)&server_addr, sizeof(struct sockaddr_in));
+    while (res < 0) {
+        res = connect(client_socket, (struct sockaddr *)&server_addr, sizeof(struct sockaddr_in));
+    }
+}
+
+int do_receive() {
+    pbuf = 0;
+    ssize_t size = recv(client_socket, (void*)((char*)buf + pbuf), BUFFER_SIZE, 0);
+    while (size > 0){
+        pbuf += size;
+        size = recv(client_socket, (void*)((char*)buf + pbuf), BUFFER_SIZE, 0);
+    }
+    if (size < 0) {
+        fprintf(stderr, "Error when receive\n");
+        return -1;
+    }
+    if (pbuf < 4 * sizeof(int) + MD5_SIZE) {
+        fprintf(stderr, "Received is not correct\n");
+        return -1;
+    }
+    return 1;
+}
+
+
+bool check_str(std::string str) {
+    std::string md5res = get_md5_sum(str.c_str());
+    return (!strcmp(md5_answer, md5res.c_str()));
+}
+
+bool try_to_find_answer() {
+    for (long long cur = interval.first; cur <= interval.second; ++cur) {
+        std::string str = ll_to_str(cur);
+        if (check_str(str)) {
+            found_answer = str;
+            return true;
+        }
+    }
+    return false;
+}
+
+void send_answer(bool res) {
+    char answer[LITTLE_STRING_SIZE];
+    strncpy(answer, found_answer.c_str(), found_answer.size());
+    send(client_socket, (void*)answer, MD5_SIZE, 0);
+}
+
+int main(int argc, char * argv[]) {
+    init_global();
+
+    int opt;
+    while ((opt = getopt(argc, argv, "s:")) != -1) {
+        switch (opt) {
+            case 's':
+                strncpy(str_server_addr, optarg, strlen(optarg));
+                parse_address(str_server_addr, server_addr);
+                break;
+            default:
+                fprintf(stderr, "Unknown argument\n");
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    while (1) {
+        client_socket = socket(PF_INET, SOCK_STREAM, 0);
+        endless_try_to_connect();
+
+        int res = do_receive();
+        close(client_socket);
+        if (res <= 0) {
+            sleep(TIME_SLEEP);
+            continue;
+        }
+
+        parse_buffer();
+        bool result_find = try_to_find_answer();
+
+        endless_try_to_connect();
+        send_answer(result_find);
+        close(client_socket);
+
+        if (result_find) {
+            break;
+        }
+    }
+
+    free(buf);
+    return 0;
+}
+
